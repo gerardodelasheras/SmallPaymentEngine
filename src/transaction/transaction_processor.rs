@@ -1,10 +1,11 @@
 use std::collections::HashMap;
 
 use crate::account::account::Account;
+use crate::amount::Amount;
 use crate::client::id::ClientId;
 use crate::processing_error::ProcessingError;
 use crate::transaction::transaction::Transaction;
-use crate::transaction::transaction_entry::{EntryState, TransactionEntry};
+use crate::transaction::transaction_entry::TransactionEntry;
 use crate::transaction::transaction_id::TransactionId;
 use crate::transaction::transaction_type::TransactionType;
 
@@ -34,16 +35,15 @@ impl TransactionProcessor {
         }
 
         match transaction.transaction_type {
-            TransactionType::Deposit | TransactionType::Withdrawal => {
-                self.apply_monetary(transaction)
-            }
-            TransactionType::Dispute => self.apply_dispute(transaction),
-            TransactionType::Resolve => self.apply_resolve(transaction),
-            TransactionType::Chargeback => self.apply_chargeback(transaction),
+            TransactionType::Deposit => self.process_deposit(transaction),
+            TransactionType::Withdrawal => self.process_withdrawal(transaction),
+            TransactionType::Dispute => self.process_dispute(transaction),
+            TransactionType::Resolve => self.process_resolve(transaction),
+            TransactionType::Chargeback => self.process_chargeback(transaction),
         }
     }
 
-    fn apply_monetary(&mut self, transaction: &Transaction) -> Result<(), ProcessingError> {
+    fn process_deposit(&mut self, transaction: &Transaction) -> Result<(), ProcessingError> {
         let amount = transaction.amount.ok_or(ProcessingError::MissingAmount)?;
         if self.entries.contains_key(&transaction.transaction_id) {
             return Err(ProcessingError::DuplicateTransaction(
@@ -51,85 +51,99 @@ impl TransactionProcessor {
             ));
         }
 
-        let account = self
-            .accounts
-            .get_mut(&transaction.client)
-            .expect("account initialized");
-        match transaction.transaction_type {
-            TransactionType::Deposit => account.credit(amount)?,
-            TransactionType::Withdrawal => account.debit(amount)?,
-            _ => unreachable!("apply_monetary only handles monetary transactions"),
+        self.account_mut(transaction.client).credit(amount)?;
+        self.record_settled(transaction, amount);
+        Ok(())
+    }
+
+    fn process_withdrawal(&mut self, transaction: &Transaction) -> Result<(), ProcessingError> {
+        let amount = transaction.amount.ok_or(ProcessingError::MissingAmount)?;
+        if self.entries.contains_key(&transaction.transaction_id) {
+            return Err(ProcessingError::DuplicateTransaction(
+                transaction.transaction_id,
+            ));
         }
 
+        self.account_mut(transaction.client).debit(amount)?;
+        self.record_settled(transaction, amount);
+        Ok(())
+    }
+
+    fn record_settled(&mut self, transaction: &Transaction, amount: Amount) {
         self.entries.insert(
             transaction.transaction_id,
-            TransactionEntry {
+            TransactionEntry::Settled {
                 client: transaction.client,
                 amount,
-                kind: transaction.transaction_type,
-                state: EntryState::Settled,
             },
         );
-        Ok(())
+    }
+
+    fn account_mut(&mut self, client: ClientId) -> &mut Account {
+        self.accounts.entry(client).or_default()
     }
 
     fn lookup(&self, transaction: &Transaction) -> Result<TransactionEntry, ProcessingError> {
         let entry = self.entries.get(&transaction.transaction_id).ok_or(
             ProcessingError::UnknownTransaction(transaction.transaction_id),
         )?;
-        if entry.client != transaction.client {
+        let owner = match entry {
+            TransactionEntry::Settled { client, .. }
+            | TransactionEntry::Disputed { client, .. } => *client,
+        };
+        if owner != transaction.client {
             return Err(ProcessingError::NotOwner(transaction.transaction_id));
         }
         Ok(*entry)
     }
 
-    fn apply_dispute(&mut self, transaction: &Transaction) -> Result<(), ProcessingError> {
-        let entry = self.lookup(transaction)?;
-        if entry.state == EntryState::Disputed {
-            return Err(ProcessingError::AlreadyDisputed(transaction.transaction_id));
-        }
+    fn process_dispute(&mut self, transaction: &Transaction) -> Result<(), ProcessingError> {
+        let amount = match self.lookup(transaction)? {
+            TransactionEntry::Settled { amount, .. } => amount,
+            TransactionEntry::Disputed { .. } => {
+                return Err(ProcessingError::AlreadyDisputed(transaction.transaction_id));
+            }
+        };
 
-        let account = self
-            .accounts
-            .get_mut(&transaction.client)
-            .expect("account initialized");
-        account.hold(entry.amount)?;
-        self.entries
-            .get_mut(&transaction.transaction_id)
-            .expect("entry exists")
-            .state = EntryState::Disputed;
+        self.account_mut(transaction.client).hold(amount)?;
+        self.entries.insert(
+            transaction.transaction_id,
+            TransactionEntry::Disputed {
+                client: transaction.client,
+                amount,
+            },
+        );
         Ok(())
     }
 
-    fn apply_resolve(&mut self, transaction: &Transaction) -> Result<(), ProcessingError> {
-        let entry = self.lookup(transaction)?;
-        if entry.state != EntryState::Disputed {
-            return Err(ProcessingError::NotDisputed(transaction.transaction_id));
-        }
+    fn process_resolve(&mut self, transaction: &Transaction) -> Result<(), ProcessingError> {
+        let amount = match self.lookup(transaction)? {
+            TransactionEntry::Disputed { amount, .. } => amount,
+            TransactionEntry::Settled { .. } => {
+                return Err(ProcessingError::NotDisputed(transaction.transaction_id));
+            }
+        };
 
-        let account = self
-            .accounts
-            .get_mut(&transaction.client)
-            .expect("account initialized");
-        account.release(entry.amount)?;
-        self.entries
-            .get_mut(&transaction.transaction_id)
-            .expect("entry exists")
-            .state = EntryState::Settled;
+        self.account_mut(transaction.client).release(amount)?;
+        self.entries.insert(
+            transaction.transaction_id,
+            TransactionEntry::Settled {
+                client: transaction.client,
+                amount,
+            },
+        );
         Ok(())
     }
 
-    fn apply_chargeback(&mut self, transaction: &Transaction) -> Result<(), ProcessingError> {
-        let entry = self.lookup(transaction)?;
-        if entry.state != EntryState::Disputed {
-            return Err(ProcessingError::NotDisputed(transaction.transaction_id));
-        }
+    fn process_chargeback(&mut self, transaction: &Transaction) -> Result<(), ProcessingError> {
+        let amount = match self.lookup(transaction)? {
+            TransactionEntry::Disputed { amount, .. } => amount,
+            TransactionEntry::Settled { .. } => {
+                return Err(ProcessingError::NotDisputed(transaction.transaction_id));
+            }
+        };
 
-        let account = self
-            .accounts
-            .get_mut(&transaction.client)
-            .expect("account initialized");
-        account.chargeback(entry.amount)?;
+        self.account_mut(transaction.client).chargeback(amount)?;
         self.entries.remove(&transaction.transaction_id);
         Ok(())
     }
@@ -394,5 +408,56 @@ mod tests {
             Err(ProcessingError::InsufficientFunds)
         ));
         assert_eq!(account(&processor, 1), Account::default());
+    }
+
+    #[test]
+    fn missing_amount_leaves_the_transaction_id_available() {
+        let mut processor = TransactionProcessor::new();
+
+        assert!(matches!(
+            processor.process(&transaction(TransactionType::Deposit, 7, 42, None)),
+            Err(ProcessingError::MissingAmount)
+        ));
+        assert_eq!(account(&processor, 7), Account::default());
+
+        deposit(&mut processor, 7, 42, "3.0");
+        assert_eq!(account(&processor, 7).available, amount("3.0").unwrap());
+    }
+
+    #[test]
+    fn rejected_duplicate_does_not_replace_the_original_entry() {
+        let mut processor = TransactionProcessor::new();
+        deposit(&mut processor, 3, 900, "10.0");
+
+        assert!(matches!(
+            processor.process(&transaction(TransactionType::Deposit, 3, 900, Some("5.0"))),
+            Err(ProcessingError::DuplicateTransaction(900))
+        ));
+
+        processor
+            .process(&transaction(TransactionType::Dispute, 3, 900, None))
+            .expect("dispute succeeds");
+        assert_eq!(account(&processor, 3).held, amount("10.0").unwrap());
+    }
+
+    #[test]
+    fn locked_account_rejects_missing_amount_before_it_is_validated() {
+        let mut processor = TransactionProcessor::new();
+        deposit(&mut processor, 5, 100, "10.0");
+        processor
+            .process(&transaction(TransactionType::Dispute, 5, 100, None))
+            .expect("dispute succeeds");
+        processor
+            .process(&transaction(TransactionType::Chargeback, 5, 100, None))
+            .expect("chargeback succeeds");
+
+        assert!(matches!(
+            processor.process(&transaction(TransactionType::Withdrawal, 5, 101, None)),
+            Err(ProcessingError::AccountLocked)
+        ));
+
+        let account = account(&processor, 5);
+        assert!(account.locked);
+        assert_eq!(account.total(), Amount::ZERO);
     }
 }
