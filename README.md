@@ -394,3 +394,13 @@ acceptance-tests/             behave suite executing the OpenSpec specs
   steps/                      Domain step definitions
   pages/                      CLI page object
 ```
+
+## AI Assistance
+
+This implementation was developed with AI assistance using:
+
+- **opencode** — Agentic coding environment
+- **DeepSeek** — Language model used for implementation and review
+- **Minimax** — Language model used for implementation and review
+- **intent-driven-development** — Change planning and execution workflow - https://github.com/intent-driven-dev/intent-driven-template
+- **rust-skills** — Rust coding guidelines and review rules — https://github.com/leonardomso/rust-skills
