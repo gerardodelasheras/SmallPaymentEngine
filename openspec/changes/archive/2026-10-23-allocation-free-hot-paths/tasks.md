@@ -38,4 +38,4 @@ Zone discipline: add and commit the specs-zone delta first, verify the new scena
 
 ## 6. Completion
 
-- [ ] 6.1 Verify code-zone and specs-zone commits stayed separate, then hand off to sync/archive after implementation is merged.
+- [x] 6.1 Verify code-zone and specs-zone commits stayed separate, then hand off to sync/archive after implementation is merged.
