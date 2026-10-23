@@ -1,27 +1,54 @@
+//! Fixed-point currency: every amount is an `i64` scaled by 10_000.
+
 use std::fmt;
 use std::ops::{Add, Sub};
 
 use crate::processing_error::ProcessingError;
 
 /// Number of fixed-point units in one whole currency unit.
+///
+/// For example, `1.23` is stored as `12_300` (`1.23 * 10_000`).
 pub const SCALE: i64 = 10_000;
 
 /// A monetary amount stored as an `i64` scaled by [`SCALE`].
+///
+/// Floating point is never used for parsing, arithmetic, or rendering.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Amount(i64);
 
 impl Amount {
+    /// The zero amount.
     pub const ZERO: Amount = Amount(0);
 
+    /// Creates an amount from an already scaled integer.
+    ///
+    /// This bypasses decimal parsing and is intended for tests and boundary
+    /// values.
     pub fn from_scaled(scaled: i64) -> Self {
         Amount(scaled)
     }
 
+    /// Returns the underlying scaled integer.
     pub fn scaled(self) -> i64 {
         self.0
     }
 
     /// Parses a non-negative decimal string with at most four fractional digits.
+    ///
+    /// Accepted forms include whole values (`"42"`), fractional values
+    /// (`"1.23"`, `"1.2300"`), a leading decimal point (`".5"`), and
+    /// surrounding whitespace.
+    ///
+    /// Rejected forms include empty input, a bare `"."`, more than one decimal
+    /// point, non-digit text, a leading sign, fractions longer than four
+    /// digits, and values that do not fit in the scaled `i64`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProcessingError::InvalidAmount`] for malformed text,
+    /// [`ProcessingError::NegativeAmount`] for a leading `-`,
+    /// [`ProcessingError::TooManyDecimals`] for more than four fraction digits,
+    /// and [`ProcessingError::Overflow`] when the scaled value does not fit.
     pub fn parse(input: &str) -> Result<Self, ProcessingError> {
         let text = input.trim();
         if text.is_empty() {
@@ -34,6 +61,7 @@ impl Amount {
             return Err(ProcessingError::InvalidAmount(input.to_string()));
         }
 
+        // Split once and reject a second decimal point before validating digits.
         let mut parts = text.split('.');
         let integer = parts.next().unwrap_or("");
         let fraction = parts.next();
@@ -42,6 +70,7 @@ impl Amount {
         }
         let fraction = fraction.unwrap_or("");
 
+        // "." and "" carry no digits at all.
         if integer.is_empty() && fraction.is_empty() {
             return Err(ProcessingError::InvalidAmount(input.to_string()));
         }
@@ -61,6 +90,7 @@ impl Amount {
             integer.parse().map_err(|_| ProcessingError::Overflow)?
         };
 
+        // Right-pad the fraction to four digits so "1.5" becomes 15_000.
         let mut fraction_digits = String::from(fraction);
         while fraction_digits.len() < 4 {
             fraction_digits.push('0');
@@ -80,15 +110,19 @@ impl Amount {
         Ok(Amount(scaled))
     }
 
+    /// Returns `None` when the scaled sum would overflow `i64`.
     pub fn checked_add(self, other: Amount) -> Option<Amount> {
         self.0.checked_add(other.0).map(Amount)
     }
 
+    /// Returns `None` when the scaled difference would overflow `i64`.
     pub fn checked_sub(self, other: Amount) -> Option<Amount> {
         self.0.checked_sub(other.0).map(Amount)
     }
 }
 
+/// Renders the scaled value with a decimal point, preserving the sign and
+/// stripping trailing fractional zeros while keeping at least one fraction digit.
 impl fmt::Display for Amount {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let value = self.0;
@@ -97,6 +131,8 @@ impl fmt::Display for Amount {
         let whole = magnitude / SCALE as u64;
         let fraction = magnitude % SCALE as u64;
 
+        // Render exactly four fraction digits, then strip trailing zeros down
+        // to one digit ("0.0", "1.23", "0.0001").
         let mut digits = format!("{fraction:04}");
         while digits.len() > 1 && digits.ends_with('0') {
             digits.pop();
@@ -113,6 +149,10 @@ impl fmt::Display for Amount {
 impl Add for Amount {
     type Output = Amount;
 
+    /// # Panics
+    ///
+    /// Panics if the scaled sum overflows `i64`; use [`Amount::checked_add`]
+    /// when the result must be handled.
     fn add(self, rhs: Amount) -> Amount {
         self.checked_add(rhs).expect("amount overflow")
     }
@@ -121,6 +161,10 @@ impl Add for Amount {
 impl Sub for Amount {
     type Output = Amount;
 
+    /// # Panics
+    ///
+    /// Panics if the scaled difference overflows `i64`; use
+    /// [`Amount::checked_sub`] when the result must be handled.
     fn sub(self, rhs: Amount) -> Amount {
         self.checked_sub(rhs).expect("amount underflow")
     }
