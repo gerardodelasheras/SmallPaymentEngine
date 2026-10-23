@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use crate::account::account::Account;
 use crate::amount::Amount;
-use crate::client::id::ClientId;
+use crate::client::client_id::ClientId;
 use crate::processing_error::ProcessingError;
 use crate::transaction::transaction::Transaction;
 use crate::transaction::transaction_entry::TransactionEntry;

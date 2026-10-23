@@ -1,5 +1,5 @@
 use crate::amount::Amount;
-use crate::client::id::ClientId;
+use crate::client::client_id::ClientId;
 
 /// An accepted monetary transaction kept for later dispute operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

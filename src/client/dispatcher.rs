@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::client::id::ClientId;
+use crate::client::client_id::ClientId;
 
 /// Assigns each client to a worker and pins it there.
 #[derive(Debug)]

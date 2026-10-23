@@ -1,5 +1,5 @@
 use crate::amount::Amount;
-use crate::client::id::ClientId;
+use crate::client::client_id::ClientId;
 use crate::transaction::transaction_id::TransactionId;
 use crate::transaction::transaction_type::TransactionType;
 

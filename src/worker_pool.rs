@@ -4,7 +4,7 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{error, trace};
 
 use crate::account::account::Account;
-use crate::client::id::ClientId;
+use crate::client::client_id::ClientId;
 use crate::processing_error::ProcessingError;
 use crate::transaction::transaction::Transaction;
 use crate::transaction::transaction_processor::TransactionProcessor;

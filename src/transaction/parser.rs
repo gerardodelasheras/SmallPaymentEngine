@@ -6,7 +6,7 @@ use csv::{ReaderBuilder, StringRecord, Trim};
 use serde::Deserialize;
 
 use crate::amount::Amount;
-use crate::client::id::ClientId;
+use crate::client::client_id::ClientId;
 use crate::processing_error::ProcessingError;
 use crate::transaction::transaction::Transaction;
 use crate::transaction::transaction_id::TransactionId;

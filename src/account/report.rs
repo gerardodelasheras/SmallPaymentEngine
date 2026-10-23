@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::io::Write;
 
 use crate::account::account::Account;
-use crate::client::id::ClientId;
+use crate::client::client_id::ClientId;
 use crate::processing_error::ProcessingError;
 
 pub const HEADER: &str = "client,available,held,total,locked";
