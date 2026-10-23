@@ -18,13 +18,15 @@ cargo run -- transactions.csv > accounts.csv
 The binary takes exactly one positional argument: the input CSV path. Standard
 output contains only the accounts CSV; diagnostics go to standard error.
 
-Set `RUST_LOG` to control diagnostic verbosity, including full trace logging:
+Set `RUST_LOG` to control diagnostic verbosity in debug and test builds,
+including full trace logging:
 
 ```sh
 RUST_LOG=trace cargo run -- transactions.csv > accounts.csv
 ```
 
-Logs still go to standard error, so stdout remains valid accounts CSV.
+Release builds compile trace and debug events out and clamp `RUST_LOG` to
+`info`. Logs go to standard error, so stdout remains valid accounts CSV.
 
 ## Architecture
 
@@ -67,8 +69,9 @@ Key properties:
 - **Fixed-point currency.** Every amount is an `i64` scaled by `10_000`
   (`1.23` is stored as `12300`). No floating point or decimal crate is used in
   the ledger or amount path.
-- **Order-independent output.** Row order is unspecified. Worker assignment is
-  not visible in stdout.
+- **Deterministic output order.** The report currently sorts rows by client,
+  though the contract does not require consumers to depend on row order.
+  Worker assignment is not visible in stdout.
 
 ## Data Flow & Domain Entities
 
@@ -173,15 +176,17 @@ deposit,1,1,1.0
 withdrawal,1,2,0.5
 ```
 
-Rows that cannot be parsed or validated are skipped with a diagnostic. This
-includes unknown types, missing or unexpected amounts, invalid UTF-8, invalid
-client or transaction IDs, malformed decimals, negatives, more than four
-fraction digits, and overflow.
+Rows that cannot be parsed or validated are skipped. With `RUST_LOG=trace`, a
+diagnostic is written to stderr. This includes unknown types, missing or
+unexpected amounts, invalid UTF-8, invalid client or transaction IDs, malformed
+decimals, negatives, more than four fraction digits, and overflow. A malformed
+or renamed header is not a row failure; it fails the run before row iteration.
 
 ### Output schema
 
 The output is `client,available,held,total,locked`, one row per initialized
-client. Row order is unspecified.
+client. The current writer sorts by client; the contract does not require
+consumers to depend on row order.
 
 | Column | Type | Notes |
 |---|---|---|
@@ -207,22 +212,31 @@ client,available,held,total,locked
 
 - `src/amount.rs` covers fixed-point parsing and formatting: whole and fractional
   amounts, whitespace trimming, varied fraction lengths, leading-dot fractions,
-  negative rejection, too many decimals, malformed input, `i64` overflow,
-  checked arithmetic, `Display`, and operator overflow behavior.
+  edge forms such as `1.` and `00.5`, negative rejection, too many decimals,
+  malformed input, `i64` overflow, checked arithmetic, canonical `Display`
+  output, and error precedence/payloads.
 - `src/account/account.rs` covers the zeroed default, the
-  `total = available + held` invariant, and overflow handling that leaves
+  `total = available + held` invariant, and credit overflow that leaves
   balances unchanged.
+- `src/account/report.rs` covers the empty-map header and client-row rendering.
+- `src/transaction/parser.rs` covers header matching, reordered and extra
+  columns, short non-monetary rows, malformed rows, invalid UTF-8, identifier
+  ranges, and amount-presence rules.
 - `src/transaction/transaction_processor.rs` covers every state-machine path:
-  deposit and withdrawal entries, successful and insufficient withdrawals,
-  dispute holds funds (including negative available balances), unknown
-  transactions, duplicate disputes, resolve,
-  invalid resolve, chargeback, invalid chargeback, locked-account rejection,
-  cross-client disputes, and zeroed initialization of unknown clients.
+  deposits and withdrawals, insufficient withdrawals, dispute holds (including
+  negative available balances), unknown transactions, duplicate disputes,
+  resolve, invalid resolve, chargeback, invalid chargeback, locked-account
+  rejection, cross-client disputes, duplicate IDs, missing amounts, terminal
+  account drains, and zeroed initialization of unknown clients.
+- `src/transaction/transaction_type.rs` covers parsing, trimming, and rejecting
+  type names.
 - `src/client/dispatcher.rs` covers assigned-count priority, capacity
   tie-breaking, round-robin tie-breaking, spreading new clients across workers,
   and stable client pinning.
-- `src/worker_pool.rs` covers remaining queue capacity, closed dispatch and
-  collection channels, and backpressure when a queue is full.
+- `src/pipeline.rs` covers the pinned-client capacity fast path.
+- `src/worker_pool.rs` covers worker count and initial queue capacity,
+  processed-account collection, rejected rows, closed channels, worker panics
+  during collection, and blocking backpressure.
 
 ### Integration tests
 
@@ -255,8 +269,9 @@ acceptance-tests/.venv/bin/python acceptance-tests/run_acceptance.py
 ```
 
 `cargo test` runs the unit and integration suites. The acceptance runner builds
-the binary, extracts every `spec.md` under `openspec/` into
-`acceptance-tests/.extracted/`, runs the effective spec, and writes
+the binary, extracts the source-of-truth specs and active change deltas from
+`openspec/` into `acceptance-tests/.extracted/` (archived changes are excluded),
+composes the effective spec, and writes
 `acceptance-tests/reports/behave-report.html`. `.extracted/`, `reports/`, and
 `.venv/` are generated and gitignored.
 
@@ -265,9 +280,10 @@ ingestion, transaction processing, account reporting, and the CLI contract.
 
 ### CSV regression fixtures
 
-`tests/transactions0.csv` and `tests/transactions1.csv` are synthetic cases
-(generated values, not the specification examples). `tests/run_tests.sh`
-regenerates the matching `tests/accounts*.csv` references and fails on drift:
+The `tests/transactions*.csv` fixtures (currently `transactions0.csv` through
+`transactions2.csv`) are synthetic cases generated from values that differ from
+the specification examples. `tests/run_tests.sh` regenerates the matching
+`tests/accounts*.csv` references and fails on drift:
 
 ```sh
 ./tests/run_tests.sh
@@ -277,8 +293,9 @@ regenerates the matching `tests/accounts*.csv` references and fails on drift:
 
 - **Exact money.** Amounts are scaled `i64` values; floating point is absent from
   the parser, ledger, and formatter.
-- **Distinct identifiers.** `ClientId` is `u16`; `TransactionId` is `u32`. They
-  cannot be accidentally interchanged.
+- **Distinct identifier widths.** `ClientId` is a `u16` alias and
+  `TransactionId` is a `u32` alias, so the compiler rejects swapping the two
+  types without a cast. They are aliases, not newtypes.
 - **Recoverable ledger arithmetic.** Balance mutations use checked
   `credit`/`debit`/`hold`/`release`/`chargeback` paths. Overflow becomes a
   `ProcessingError` and the row is skipped. `Amount`'s `Add`/`Sub` operators are
@@ -295,17 +312,24 @@ regenerates the matching `tests/accounts*.csv` references and fails on drift:
 
 ## Error Handling
 
-Row-level failures are logged and skipped so the stream can continue. Examples
-include `InvalidType`, `InvalidAmount`, `NegativeAmount`, `TooManyDecimals`,
-`MissingAmount`, `UnexpectedAmount`, `InsufficientFunds`, `AccountLocked`,
-`UnknownTx`, `NotOwner`, `Overflow`, and CSV deserialization errors.
+Row-level failures are skipped so the stream can continue. With
+`RUST_LOG=trace`, they are logged to stderr. Examples include `InvalidType`,
+`InvalidAmount`, `NegativeAmount`, `TooManyDecimals`, `MissingAmount`,
+`UnexpectedAmount`, `InsufficientFunds`, `AccountLocked`,
+`UnknownTransaction`, `AlreadyDisputed`, `NotDisputed`, `NotOwner`,
+`DuplicateTransaction`, `Overflow`, `Underflow`, and non-I/O `Csv` row errors.
 
 Infrastructure failures fail the run instead of producing silently incomplete
 output:
 
-- `WorkerUnavailable` when the producer or a worker channel closes.
+- `WorkerUnavailable` when the producer or a worker channel closes, a worker
+  task panics, or the reader task fails.
+- `FileOpen` when the input file cannot be opened; the path is included.
 - `Io` when writing the accounts CSV fails.
-- `Csv` when reading or deserializing the input CSV fails.
+- `InvalidHeader` when the input header is missing or invalid; this is detected
+  before row iteration.
+- `Csv` when reading the header fails, or when a row error wraps an I/O error;
+  ordinary per-row CSV deserialization errors are row-level and are skipped.
 
 `main` prints the error to stderr and exits with a non-zero status.
 
@@ -325,8 +349,10 @@ output:
   explicitly requires ignoring unknown transactions; rejecting a transaction
   that is already under dispute follows conservative account behavior.
 - **Cross-client references are ignored.** A dispute, resolve, or chargeback
-  must reference a transaction owned by the same client. A mismatched owner is
-  skipped with `NotOwner`.
+  must reference a transaction owned by the same client. When both clients are
+  assigned to the same worker, the mismatch is skipped with `NotOwner`; when
+  they are on different workers, the entry is absent from the referencing
+  worker's index and is skipped with `UnknownTransaction`.
 - **Unknown clients may be initialized by rejected rows.** A parsed transaction
   creates a zeroed account for its client before the operation is validated, so
   a client can appear in the final report even when its first operation is
@@ -368,17 +394,17 @@ src/                          Shared library and binary entry points
     account.rs                Client account and ledger operations
     report.rs                 Accounts CSV writer
   client/                     Client identity and routing
+    client_id.rs              ClientId alias
     dispatcher.rs             Least-loaded client-to-worker assignment
-    id.rs                     ClientId alias
   transaction/                Transaction model, parsing, and processing
     parser.rs                 CSV parsing and validation
     transaction.rs            Transaction input row
     transaction_entry.rs      Settled/Disputed lifecycle entry
     transaction_id.rs         TransactionId alias
     transaction_processor.rs  Per-worker account and entry state machine
-    transaction_type.rs       Deposit/withdrawal/dispute operation enum
+    transaction_type.rs       Deposit/withdrawal/dispute/resolve/chargeback enum
   amount.rs                   Fixed-point i64 currency and formatting
-  lib.rs                      Public crate exports
+  lib.rs                      Crate module declarations and visibility
   main.rs                     CLI entry point
   pipeline.rs                 Streaming ingestion, dispatch, and output
   processing_error.rs         Recoverable and infrastructure errors
@@ -390,9 +416,14 @@ tests/
   accounts*.csv               Reference account outputs
 acceptance-tests/             behave suite executing the OpenSpec specs
   run_acceptance.py           Single entry point
+  extract_gherkin.py          Markdown spec -> .feature extractor
+  openspec_effective_spec.py  Applies active-change supersession
+  behave.ini                  behave runner and report configuration
+  .gherkin-lintrc             Gherkin lint rules
   environment.py              Builds the binary and resets per-scenario state
   steps/                      Domain step definitions
   pages/                      CLI page object
+  requirements.txt            Python harness dependencies
 ```
 
 ## AI Assistance
