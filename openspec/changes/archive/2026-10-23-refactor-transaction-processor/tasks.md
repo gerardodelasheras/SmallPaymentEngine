@@ -37,4 +37,4 @@ Zone discipline: the specs-zone delta is authored before this code-zone work; ke
 
 ## 6. Completion
 
-- [ ] 6.1 Verify code-zone and specs-zone commits stayed separate, then hand off to the archive workflow after implementation is merged and the delta is synced.
+- [x] 6.1 Verify code-zone and specs-zone commits stayed separate, then hand off to the archive workflow after implementation is merged and the delta is synced.
