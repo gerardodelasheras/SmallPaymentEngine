@@ -1,0 +1,6 @@
+/target/
+/acceptance-tests/.extracted/
+/acceptance-tests/reports/
+/acceptance-tests/.venv/
+__pycache__/
+*.pyc
