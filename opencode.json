@@ -1,0 +1,12 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": ["superpowers@git+https://github.com/obra/superpowers.git"],
+  "model": "deepseek-flash",
+  "compaction": {
+    "auto": true,
+    "buffer": "10%",
+    "keep": {
+      "tokens": 100000
+    }
+  }
+}

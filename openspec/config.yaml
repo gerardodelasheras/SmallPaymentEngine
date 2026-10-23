@@ -1,0 +1,71 @@
+# openspec/config.yaml
+schema: intent-driven
+stack: python
+
+context: |
+  Tech stack: Rust (Single Package containing 1 Shared Lib Crate + 1 Standard Binary Crate)
+  
+  Target Outputs:
+    - transaction_processor: Compiled from `src/main.rs`. Enforces memory-efficient, local CSV-to-stdout streaming.
+  
+  Shared Core: All transaction logic, error handlers, and worker actor loops must live inside the library crate (`src/lib.rs`) for reuse by the standard binary and future variants.
+
+  Core Libraries:
+    - Runtime: tokio (Async multi-threaded runtime)
+    - Serialization: serde derive
+    - Architecture Pattern: Actor pattern via Tokio channels (`mpsc`/`oneshot`)
+    - Error Handling Strategy: Explicit, recoverable domain errors (`thiserror`)
+
+  Domain: High-performance streaming transaction processor
+
+  Target Variant: In-Memory Streaming (Fulfill standard CLI specification first)
+  Future Variants: Kafka streaming, gRPC streaming, WebSocket streaming, and HTTP streaming, Atomic transactional database-backed streaming. etc.
+
+
+  Agents:
+    - senior-dev: Handles all `src/` code implementation (iterative, memory-efficient streams).
+    - senior-qa: Handles all test files (`tests/`), test data, and correctness criteria.
+
+  Commit Strategy: Conventional Commits     
+
+  Special Instructions:
+    - Never include sample or production input CSV data in git commits.
+    - Automated tests must use generated/different numbers than the specification text.
+    - Stream memory rather than buffering full datasets (u32 tx IDs, u16 client IDs).
+    - Interleave dev implementation and QA verification loops aggressively.
+    - Floating point operations are strictly prohibited. All amounts must be expressed in `i64` scaled by `10_000` to avoid precision drift (e.g., \$1.23 = 12300).
+    - Worker Design: Client state is partitioned across a fixed pool of workers. Each worker owns its clients' accounts and transaction index; transactions are dispatched via message-passing (`tokio::sync::mpsc`).
+    - Isolation Invariant: A malformed transaction, precision overflow, or invalid dispute must return an error message to the stream pipeline without taking down the actor or crashing the runtime thread.
+    - Delivery Model: The public submission repo  receives only the sanitized `src/` module, Cargo.toml, Cargo.lock, tests/ and a `README.md` that omits any mention of Kraken, Payward, or the challenge source.
+    - Add the TRACE otpion for thrown errors to stderr for debugging, but it must be disabled in production builds. Use `RUST_LOG=trace` to enable it in dev/test builds.
+
+domains:
+  - processor       # CLI, streaming orchestration, and accounts output. This is the minimal payment engine entry pint, but processor is the more accurate name.
+  - client          # Client identity and worker routing.
+  - accounts        # Client profile structures, balances, locking logic, precision math.
+  - transactions    # Transaction model, parsing, and state-machine processing.
+  - test-harness    # Committed CSV regression cases and optional runner.
+  - amounts         # Amount math, scaling, and overflow detection.
+
+rules:
+  proposal:
+    - Must use grill-me skill
+    - Must use adversarial-authoring skill
+  design:
+    - Must use c4-diagrams skill
+  adr:
+    - Must use architectural-decision-records skill
+  specs:
+    - Must use spec-as-source skill
+  tasks:
+    - Must use spec-as-source skill
+
+operations:
+  apply:
+    guidance:
+      - Must use test-driven-development skill
+  archive:
+    guidance:
+      - Must run OpenSpec Sync before archiving when the change has delta specs
+
+
