@@ -1,4 +1,6 @@
 /target/
+/.agents/
+/.opencode/
 /acceptance-tests/.extracted/
 /acceptance-tests/reports/
 /acceptance-tests/.venv/
