@@ -1,3 +1,8 @@
+//! Command-line entry point for the in-memory streaming processor.
+//!
+//! Usage: `transaction_processor <transactions.csv>`.
+//! The accounts CSV is written to stdout; diagnostics are written to stderr.
+
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -30,6 +35,8 @@ async fn main() -> ExitCode {
     }
 }
 
+/// Installs stderr tracing, defaulting to warnings. Release builds clamp
+/// `RUST_LOG` because trace and debug events are compiled out of release.
 fn init_tracing() {
     #[cfg(not(debug_assertions))]
     {

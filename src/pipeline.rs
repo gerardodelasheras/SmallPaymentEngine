@@ -33,7 +33,10 @@ pub async fn process<W: Write>(path: &Path, out: &mut W) -> Result<(), Processin
 }
 
 fn read_and_dispatch(path: &Path, pool: &WorkerPool) -> Result<(), ProcessingError> {
-    let file = File::open(path)?;
+    let file = File::open(path).map_err(|source| ProcessingError::FileOpen {
+        path: path.to_path_buf(),
+        source,
+    })?;
     let reader = BufReader::new(file);
     let transactions = parser::transactions(reader)?;
     let mut dispatcher = ClientDispatcher::new(pool.worker_count());

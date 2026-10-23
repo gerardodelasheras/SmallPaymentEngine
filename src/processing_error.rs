@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use thiserror::Error;
 
 /// Unified error type for row-level validation, ledger rules, and infrastructure.
@@ -59,13 +61,21 @@ pub enum ProcessingError {
 
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("cannot open {}: {source}", path.display())]
+    FileOpen {
+        path: PathBuf,
+        source: std::io::Error,
+    },
 }
 
 impl ProcessingError {
     /// Whether a row-level failure may be skipped while the stream continues.
     pub fn is_recoverable(&self) -> bool {
         match self {
-            ProcessingError::Io(_) | ProcessingError::WorkerUnavailable(_) => false,
+            ProcessingError::Io(_)
+            | ProcessingError::FileOpen { .. }
+            | ProcessingError::WorkerUnavailable(_) => false,
             ProcessingError::Csv(error) => !matches!(error.kind(), csv::ErrorKind::Io(_)),
             _ => true,
         }
