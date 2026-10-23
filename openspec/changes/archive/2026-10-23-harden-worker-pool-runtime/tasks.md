@@ -47,4 +47,4 @@ Zone discipline: the specs-zone delta is authored first; keep the subsequent cod
 
 ## 7. Completion
 
-- [ ] 7.1 Verify code-zone and specs-zone commits stayed separate, then hand off to sync/archive after implementation is merged.
+- [x] 7.1 Verify code-zone and specs-zone commits stayed separate, then hand off to sync/archive after implementation is merged.
