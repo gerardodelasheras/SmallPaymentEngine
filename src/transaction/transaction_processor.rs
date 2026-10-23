@@ -148,6 +148,10 @@ impl TransactionProcessor {
         Ok(())
     }
 
+    pub(crate) fn take_accounts(&mut self) -> HashMap<ClientId, Account> {
+        std::mem::take(&mut self.accounts)
+    }
+
     pub fn accounts(&self) -> &HashMap<ClientId, Account> {
         &self.accounts
     }
@@ -438,6 +442,17 @@ mod tests {
             .process(&transaction(TransactionType::Dispute, 3, 900, None))
             .expect("dispute succeeds");
         assert_eq!(account(&processor, 3).held, amount("10.0").unwrap());
+    }
+
+    #[test]
+    fn take_accounts_moves_the_map_out() {
+        let mut processor = TransactionProcessor::new();
+        deposit(&mut processor, 9, 1, "4.0");
+
+        let accounts = processor.take_accounts();
+
+        assert_eq!(accounts[&9].available, amount("4.0").unwrap());
+        assert!(processor.accounts().is_empty());
     }
 
     #[test]

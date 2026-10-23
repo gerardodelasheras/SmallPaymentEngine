@@ -10,22 +10,34 @@ use crate::transaction::transaction::Transaction;
 use crate::transaction::transaction_processor::TransactionProcessor;
 
 /// Bounded per-worker queue capacity.
-pub const QUEUE_CAPACITY: usize = 256;
+const QUEUE_CAPACITY: usize = 256;
 
-pub enum Command {
+/// Upper bound on worker tasks, keeping in-flight work bounded.
+const MAX_WORKERS: usize = 16;
+
+enum Command {
     Process(Transaction),
-    Snapshot(oneshot::Sender<HashMap<ClientId, Account>>),
-    Shutdown,
+    TakeAccounts(oneshot::Sender<HashMap<ClientId, Account>>),
 }
 
 /// A fixed pool of workers, each owning a disjoint set of clients.
-pub struct WorkerPool {
+pub(crate) struct WorkerPool {
     senders: Vec<mpsc::Sender<Command>>,
     handles: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl WorkerPool {
-    pub fn spawn(workers: usize) -> Self {
+    /// Creates a pool sized to the available parallelism, clamped for bounded
+    /// in-flight work.
+    pub(crate) fn new() -> Self {
+        let workers = std::thread::available_parallelism()
+            .map(|count| count.get())
+            .unwrap_or(1)
+            .clamp(1, MAX_WORKERS);
+        Self::with_worker_count(workers)
+    }
+
+    pub(crate) fn with_worker_count(workers: usize) -> Self {
         assert!(workers > 0, "at least one worker is required");
         let mut senders = Vec::with_capacity(workers);
         let mut handles = Vec::with_capacity(workers);
@@ -37,50 +49,67 @@ impl WorkerPool {
         Self { senders, handles }
     }
 
-    pub fn senders(&self) -> Vec<mpsc::Sender<Command>> {
-        self.senders.clone()
+    pub(crate) fn worker_count(&self) -> usize {
+        self.senders.len()
     }
 
-    pub fn sender(&self, worker: usize) -> mpsc::Sender<Command> {
-        self.senders[worker].clone()
-    }
-
-    pub fn capacities(&self) -> Vec<usize> {
+    pub(crate) fn capacities(&self) -> Vec<usize> {
         self.senders.iter().map(mpsc::Sender::capacity).collect()
     }
 
-    /// Blocks the calling (non-async) thread when a worker queue is full.
-    pub fn send_blocking(&self, worker: usize, command: Command) -> Result<(), ProcessingError> {
+    /// Blocks the calling non-async thread when the worker queue is full.
+    pub(crate) fn dispatch_to(
+        &self,
+        worker: usize,
+        transaction: Transaction,
+    ) -> Result<(), ProcessingError> {
         self.senders[worker]
-            .blocking_send(command)
+            .blocking_send(Command::Process(transaction))
             .map_err(|_| ProcessingError::WorkerUnavailable("worker channel closed".to_string()))
     }
 
-    /// Collects every worker's accounts, then shuts the workers down.
-    pub async fn take_accounts(mut self) -> Result<HashMap<ClientId, Account>, ProcessingError> {
+    /// Takes every worker's accounts, then closes the senders and joins the
+    /// workers. Cleanup runs even when an earlier step fails.
+    pub(crate) async fn take_accounts(
+        mut self,
+    ) -> Result<HashMap<ClientId, Account>, ProcessingError> {
         let mut merged = HashMap::new();
+        let mut first_error = None;
+
         for sender in &self.senders {
             let (reply, receiver) = oneshot::channel();
-            sender.send(Command::Snapshot(reply)).await.map_err(|_| {
-                ProcessingError::WorkerUnavailable("snapshot request failed".to_string())
-            })?;
-            match receiver.await {
-                Ok(accounts) => merged.extend(accounts),
+            match sender.send(Command::TakeAccounts(reply)).await {
+                Ok(()) => match receiver.await {
+                    Ok(accounts) => merged.extend(accounts),
+                    Err(_) => {
+                        first_error.get_or_insert_with(|| {
+                            ProcessingError::WorkerUnavailable(
+                                "take-accounts reply dropped".to_string(),
+                            )
+                        });
+                    }
+                },
                 Err(_) => {
-                    return Err(ProcessingError::WorkerUnavailable(
-                        "snapshot reply dropped".to_string(),
-                    ))
+                    first_error.get_or_insert_with(|| {
+                        ProcessingError::WorkerUnavailable(
+                            "take-accounts request failed".to_string(),
+                        )
+                    });
                 }
             }
         }
 
-        for sender in &self.senders {
-            let _ = sender.send(Command::Shutdown).await;
-        }
+        self.senders.clear();
+
         for handle in self.handles.drain(..) {
-            let _ = handle.await;
+            if handle.await.is_err() {
+                first_error.get_or_insert_with(|| {
+                    ProcessingError::WorkerUnavailable("worker task panicked".to_string())
+                });
+            }
         }
-        Ok(merged)
+
+        first_error.map_or(Ok(merged), Err)
     }
 }
 
@@ -97,10 +126,10 @@ async fn run_worker(mut receiver: mpsc::Receiver<Command>) {
                     }
                 }
             }
-            Command::Snapshot(reply) => {
-                let _ = reply.send(processor.snapshot());
+            Command::TakeAccounts(reply) => {
+                let _ = reply.send(processor.take_accounts());
+                break;
             }
-            Command::Shutdown => break,
         }
     }
 }
@@ -110,7 +139,6 @@ mod tests {
     use super::*;
     use crate::amount::Amount;
     use crate::transaction::transaction_type::TransactionType;
-    use tokio::sync::mpsc::error::TrySendError;
 
     fn deposit(client: ClientId, id: u32, value: &str) -> Transaction {
         Transaction {
@@ -121,75 +149,131 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn queues_start_at_the_bounded_capacity() {
-        let pool = WorkerPool::spawn(2);
-        assert_eq!(pool.capacities(), vec![QUEUE_CAPACITY, QUEUE_CAPACITY]);
-        let accounts = pool.take_accounts().await.expect("pool drains");
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime")
+    }
+
+    #[test]
+    fn pool_reports_worker_count_and_capacity() {
+        let runtime = runtime();
+        let pool = {
+            let _guard = runtime.enter();
+            WorkerPool::with_worker_count(3)
+        };
+
+        assert_eq!(pool.worker_count(), 3);
+        assert_eq!(pool.capacities(), vec![QUEUE_CAPACITY; 3]);
+
+        let accounts = runtime.block_on(pool.take_accounts()).expect("pool drains");
         assert!(accounts.is_empty());
     }
 
-    #[tokio::test]
-    async fn snapshot_includes_processed_transactions() {
-        let pool = WorkerPool::spawn(1);
-        pool.sender(0)
-            .send(Command::Process(deposit(1, 1, "10.0")))
-            .await
+    #[test]
+    fn dispatch_and_drain_return_processed_accounts() {
+        let runtime = runtime();
+        let pool = {
+            let _guard = runtime.enter();
+            WorkerPool::with_worker_count(1)
+        };
+
+        pool.dispatch_to(0, deposit(1, 1, "10.0"))
             .expect("dispatch succeeds");
 
-        let accounts = pool.take_accounts().await.expect("pool drains");
+        let accounts = runtime.block_on(pool.take_accounts()).expect("pool drains");
         assert_eq!(accounts[&1].available.to_string(), "10.0");
     }
 
-    #[tokio::test]
-    async fn a_full_queue_exposes_backpressure() {
-        let pool = WorkerPool::spawn(1);
-        let sender = pool.sender(0);
-        for id in 1..=QUEUE_CAPACITY as u32 {
-            sender
-                .try_send(Command::Process(deposit(1, id, "1.0")))
-                .expect("queue has capacity");
-        }
-        let overflow = sender.try_send(Command::Process(deposit(1, 9_999, "1.0")));
-        assert!(matches!(overflow, Err(TrySendError::Full(_))));
+    #[test]
+    fn a_rejected_row_does_not_stop_the_worker() {
+        let runtime = runtime();
+        let pool = {
+            let _guard = runtime.enter();
+            WorkerPool::with_worker_count(1)
+        };
 
-        let accounts = pool.take_accounts().await.expect("pool drains");
-        assert_eq!(accounts[&1].available.to_string(), "256.0");
-    }
-
-    #[tokio::test]
-    async fn snapshot_reports_a_stopped_worker() {
-        let pool = WorkerPool::spawn(1);
-        pool.sender(0)
-            .send(Command::Shutdown)
-            .await
-            .expect("shutdown is sent");
-        assert!(pool.take_accounts().await.is_err());
-    }
-
-    #[tokio::test]
-    async fn a_rejected_row_does_not_stop_the_worker() {
-        let pool = WorkerPool::spawn(1);
-        let sender = pool.sender(0);
-        sender
-            .send(Command::Process(deposit(1, 1, "5.0")))
-            .await
+        pool.dispatch_to(0, deposit(1, 1, "5.0"))
             .expect("dispatch succeeds");
-        sender
-            .send(Command::Process(Transaction {
+        pool.dispatch_to(
+            0,
+            Transaction {
                 transaction_type: TransactionType::Withdrawal,
                 client: 1,
                 transaction_id: 2,
                 amount: Some(Amount::parse("100.0").expect("valid amount")),
-            }))
-            .await
-            .expect("dispatch succeeds");
-        sender
-            .send(Command::Process(deposit(1, 3, "7.0")))
-            .await
+            },
+        )
+        .expect("dispatch succeeds");
+        pool.dispatch_to(0, deposit(1, 3, "7.0"))
             .expect("dispatch succeeds");
 
-        let accounts = pool.take_accounts().await.expect("pool drains");
+        let accounts = runtime.block_on(pool.take_accounts()).expect("pool drains");
         assert_eq!(accounts[&1].available.to_string(), "12.0");
+    }
+
+    #[test]
+    fn a_closed_channel_is_reported_on_dispatch_and_drain() {
+        let (sender, receiver) = mpsc::channel::<Command>(1);
+        drop(receiver);
+        let pool = WorkerPool {
+            senders: vec![sender],
+            handles: Vec::new(),
+        };
+
+        assert!(matches!(
+            pool.dispatch_to(0, deposit(1, 1, "1.0")),
+            Err(ProcessingError::WorkerUnavailable(_))
+        ));
+
+        let result = runtime().block_on(pool.take_accounts());
+        assert!(matches!(result, Err(ProcessingError::WorkerUnavailable(_))));
+    }
+
+    #[test]
+    fn a_full_queue_blocks_dispatch_until_capacity_is_available() {
+        let (sender, mut receiver) = mpsc::channel::<Command>(1);
+        sender
+            .try_send(Command::Process(deposit(1, 1, "1.0")))
+            .expect("queue has capacity");
+        let pool = WorkerPool {
+            senders: vec![sender],
+            handles: Vec::new(),
+        };
+
+        let (started, started_receiver) = std::sync::mpsc::channel();
+        let dispatch = std::thread::spawn(move || {
+            started.send(()).expect("signal start");
+            pool.dispatch_to(0, deposit(1, 2, "1.0"))
+        });
+
+        started_receiver.recv().expect("dispatch thread started");
+        assert!(
+            !dispatch.is_finished(),
+            "dispatch should block while the queue is full"
+        );
+
+        let _ = receiver.blocking_recv().expect("queued command");
+        assert!(dispatch.join().expect("dispatch thread panicked").is_ok());
+    }
+
+    #[tokio::test]
+    async fn take_accounts_reports_a_panicking_worker() {
+        let (sender, mut receiver) = mpsc::channel::<Command>(1);
+        let handle = tokio::spawn(async move {
+            if let Some(Command::TakeAccounts(reply)) = receiver.recv().await {
+                let _ = reply.send(HashMap::new());
+            }
+            panic!("worker panicked after replying");
+        });
+        let pool = WorkerPool {
+            senders: vec![sender],
+            handles: vec![handle],
+        };
+
+        let result = pool.take_accounts().await;
+
+        assert!(matches!(result, Err(ProcessingError::WorkerUnavailable(_))));
     }
 }
