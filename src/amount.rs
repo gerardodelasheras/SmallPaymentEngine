@@ -90,17 +90,14 @@ impl Amount {
             integer.parse().map_err(|_| ProcessingError::Overflow)?
         };
 
-        // Right-pad the fraction to four digits so "1.5" becomes 15_000.
-        let mut fraction_digits = String::from(fraction);
-        while fraction_digits.len() < 4 {
-            fraction_digits.push('0');
-        }
-        let fractional: i64 = if fraction_digits.is_empty() {
+        let fractional: i64 = if fraction.is_empty() {
             0
         } else {
-            fraction_digits
-                .parse()
-                .map_err(|_| ProcessingError::Overflow)?
+            let fraction_value: i64 = fraction.parse().map_err(|_| ProcessingError::Overflow)?;
+            let multiplier = 10_i64.pow((4 - fraction.len()) as u32);
+            fraction_value
+                .checked_mul(multiplier)
+                .ok_or(ProcessingError::Overflow)?
         };
 
         let scaled = whole
@@ -129,20 +126,22 @@ impl fmt::Display for Amount {
         let negative = value < 0;
         let magnitude = value.unsigned_abs();
         let whole = magnitude / SCALE as u64;
-        let fraction = magnitude % SCALE as u64;
+        let mut fraction = magnitude % SCALE as u64;
+        let sign = if negative { "-" } else { "" };
 
-        // Render exactly four fraction digits, then strip trailing zeros down
-        // to one digit ("0.0", "1.23", "0.0001").
-        let mut digits = format!("{fraction:04}");
-        while digits.len() > 1 && digits.ends_with('0') {
-            digits.pop();
+        if fraction == 0 {
+            return write!(f, "{sign}{whole}.0");
         }
 
-        if negative {
-            write!(f, "-{whole}.{digits}")
-        } else {
-            write!(f, "{whole}.{digits}")
+        // Strip trailing zeros before zero-padding the remaining fraction width,
+        // so 10 renders as "0.001" rather than "0.010".
+        let mut digits = 4usize;
+        while digits > 1 && fraction.is_multiple_of(10) {
+            fraction /= 10;
+            digits -= 1;
         }
+
+        write!(f, "{sign}{whole}.{fraction:0width$}", width = digits)
     }
 }
 
@@ -281,5 +280,83 @@ mod tests {
         assert!(Amount::from_scaled(i64::MIN)
             .checked_sub(Amount::from_scaled(1))
             .is_none());
+    }
+
+    #[test]
+    fn parses_leading_dot_fraction_lengths() {
+        assert_eq!(parsed(".25").scaled(), 2_500);
+        assert_eq!(parsed(".0001").scaled(), 1);
+    }
+
+    #[test]
+    fn parses_supported_edge_forms() {
+        assert_eq!(parsed("1.").scaled(), 10_000);
+        assert_eq!(parsed("00.5").scaled(), 5_000);
+        assert_eq!(parsed("0.0000").scaled(), 0);
+    }
+
+    #[test]
+    fn rejects_bare_decimal_point_and_leading_plus() {
+        assert!(matches!(
+            Amount::parse("."),
+            Err(ProcessingError::InvalidAmount(_))
+        ));
+        assert!(matches!(
+            Amount::parse("+1"),
+            Err(ProcessingError::InvalidAmount(_))
+        ));
+    }
+
+    #[test]
+    fn preserves_error_precedence_and_payload() {
+        assert!(matches!(
+            Amount::parse("-"),
+            Err(ProcessingError::NegativeAmount(value)) if value == "-"
+        ));
+        assert!(matches!(
+            Amount::parse("+"),
+            Err(ProcessingError::InvalidAmount(value)) if value == "+"
+        ));
+        assert!(matches!(
+            Amount::parse("1.23456"),
+            Err(ProcessingError::TooManyDecimals(value)) if value == "1.23456"
+        ));
+        assert!(matches!(
+            Amount::parse("922337203685477.5808"),
+            Err(ProcessingError::Overflow)
+        ));
+        assert!(matches!(
+            Amount::parse("  -1.0  "),
+            Err(ProcessingError::NegativeAmount(value)) if value == "  -1.0  "
+        ));
+    }
+
+    #[test]
+    fn renders_boundary_and_interior_zero_values() {
+        let values = [
+            (0, "0.0"),
+            (1, "0.0001"),
+            (-1, "-0.0001"),
+            (10, "0.001"),
+            (-10, "-0.001"),
+            (100, "0.01"),
+            (-100, "-0.01"),
+            (1000, "0.1"),
+            (-1000, "-0.1"),
+            (10_000, "1.0"),
+            (-10_000, "-1.0"),
+            (1203, "0.1203"),
+            (-1203, "-0.1203"),
+            (i64::MIN, "-922337203685477.5808"),
+            (i64::MAX, "922337203685477.5807"),
+        ];
+
+        for (scaled, expected) in values {
+            assert_eq!(
+                Amount::from_scaled(scaled).to_string(),
+                expected,
+                "scaled value {scaled}"
+            );
+        }
     }
 }

@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use tracing::trace;
 
 use crate::account::report;
+use crate::client::client_id::ClientId;
 use crate::client::dispatcher::ClientDispatcher;
 use crate::processing_error::ProcessingError;
 use crate::transaction::parser;
@@ -44,8 +45,8 @@ fn read_and_dispatch(path: &Path, pool: &WorkerPool) -> Result<(), ProcessingErr
     for item in transactions {
         match item {
             Ok(transaction) => {
-                let capacities = pool.capacities();
-                let worker = dispatcher.worker_for(transaction.client, &capacities);
+                let worker =
+                    routed_worker(&mut dispatcher, transaction.client, || pool.capacities());
                 pool.dispatch_to(worker, transaction)?;
             }
             Err(error) => {
@@ -59,4 +60,55 @@ fn read_and_dispatch(path: &Path, pool: &WorkerPool) -> Result<(), ProcessingErr
     }
 
     Ok(())
+}
+
+/// Returns the pinned worker for `client`, requesting capacities only when the
+/// client has not been assigned yet.
+fn routed_worker<F>(
+    dispatcher: &mut ClientDispatcher,
+    client: ClientId,
+    capacity_supplier: F,
+) -> usize
+where
+    F: FnOnce() -> Vec<usize>,
+{
+    match dispatcher.worker_of(client) {
+        Some(worker) => worker,
+        None => dispatcher.worker_for(client, &capacity_supplier()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn pinned_clients_do_not_request_capacities() {
+        let mut dispatcher = ClientDispatcher::new(2);
+        let pinned = dispatcher.worker_for(7, &[10, 10]);
+        let supplier_calls = Cell::new(0);
+
+        let routed = routed_worker(&mut dispatcher, 7, || {
+            supplier_calls.set(supplier_calls.get() + 1);
+            vec![10, 10]
+        });
+
+        assert_eq!(routed, pinned);
+        assert_eq!(supplier_calls.get(), 0);
+    }
+
+    #[test]
+    fn new_clients_request_capacities_once() {
+        let mut dispatcher = ClientDispatcher::new(2);
+        let supplier_calls = Cell::new(0);
+
+        let routed = routed_worker(&mut dispatcher, 7, || {
+            supplier_calls.set(supplier_calls.get() + 1);
+            vec![10, 10]
+        });
+
+        assert_eq!(supplier_calls.get(), 1);
+        assert_eq!(dispatcher.worker_of(7), Some(routed));
+    }
 }
